@@ -492,7 +492,7 @@ class ESMC(nn.Module):
         )
         sequence_logits = self.sequence_head(x)
         sequence_logits = pad_fn(sequence_logits)
-        output = ESMCOutput(sequence_logits=sequence_logits, embeddings=x)
+        output = ESMCOutput(sequence_logits=sequence_logits, embeddings=pad_fn(x))
         return output
 
 
