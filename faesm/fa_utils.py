@@ -239,7 +239,7 @@ def unpad(input, padding_mask):
     batch_size, seqlen = input.shape[:2]
     assert padding_mask.shape == (batch_size, seqlen)
     assert padding_mask.dtype == torch.bool
-    input_unpad, indices_input, cu_seqlens_input, max_seqlen_input, _ = unpad_input(
+    input_unpad, indices_input, cu_seqlens_input, max_seqlen_input = unpad_input(
         input, padding_mask
     )
     output_pad_fn = lambda output_unpad: pad_input(output_unpad, indices_input, batch_size, seqlen)
