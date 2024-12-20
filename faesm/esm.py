@@ -605,10 +605,11 @@ class FAEsmForMaskedLM(EsmForMaskedLM):
         return result
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, use_fa=True, *model_args, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path, use_fa=True, from_pretrained_kwargs: dict | None = None, *model_args, **kwargs):
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
         config.use_fa = use_fa
         model = cls(config, *model_args, **kwargs)
-        ptr_model = AutoModelForMaskedLM.from_pretrained(pretrained_model_name_or_path)
+        from_pretrained_kwargs = from_pretrained_kwargs or {}
+        ptr_model = AutoModelForMaskedLM.from_pretrained(pretrained_model_name_or_path, **from_pretrained_kwargs)
         model.load_state_dict(ptr_model.state_dict(), strict=True)
         return model
