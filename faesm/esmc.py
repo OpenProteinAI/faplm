@@ -445,7 +445,8 @@ class TransformerStack(nn.Module):
             if need_head_weights:
                 x, attn = x
                 attns.append(attn)
-        attns = torch.stack(attns, dim=1)
+        if need_head_weights:
+            attns = torch.stack(attns, dim=1)
         return (self.norm(x), x) if not need_head_weights else (self.norm(x), x, attns)
 
 
@@ -575,7 +576,9 @@ if __name__ == "__main__":
     print(output.embeddings.max())
 
     with torch.inference_mode():
-        model = ESMC.from_pretrained("esmc_300m", use_flash_attn=False)
+        model = ESMC.from_pretrained(
+            "esmc_300m", device=torch.device("cpu"), use_flash_attn=False
+        )
         input_ids = model.tokenizer(sequence, return_tensors="pt")["input_ids"]
         output2 = model(input_ids, need_head_weights=True)
         print(output2.sequence_logits.mean())
@@ -584,5 +587,6 @@ if __name__ == "__main__":
         print(output2.attentions.shape)
 
     output.embeddings = output.embeddings.cpu()
+    output2.embeddings = output2.embeddings.bfloat16()
     print(torch.allclose(output.embeddings, output2.embeddings))
     print((output.embeddings - output2.embeddings).abs().max())
