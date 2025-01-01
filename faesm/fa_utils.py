@@ -173,10 +173,10 @@ class RotaryEmbedding(torch.nn.Module):
 MAX_HEADDIM_SM8x = 192
 
 
-is_sm75 = torch.cuda.get_device_capability("cuda") == (7, 5)
-is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
-is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
-is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
+# is_sm75 = torch.cuda.get_device_capability("cuda") == (7, 5)
+# is_sm8x = torch.cuda.get_device_capability("cuda")[0] == 8
+# is_sm80 = torch.cuda.get_device_capability("cuda") == (8, 0)
+# is_sm90 = torch.cuda.get_device_capability("cuda") == (9, 0)
 
 
 def attn_bias_from_alibi_slopes(

@@ -109,6 +109,36 @@ def load_local_model(
     return LOCAL_MODEL_REGISTRY[model_name](device, use_flash_attn)
 
 
+
+def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+        is_causal=False, scale=None, enable_gqa=False) -> tuple[torch.Tensor, torch.Tensor]:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+    attn_bias = torch.zeros(L, S, dtype=query.dtype)
+    if is_causal:
+        assert attn_mask is None
+        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+
+    if attn_mask is not None:
+        attn_bias = attn_bias.expand(1, 1, -1, -1)
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias += attn_mask
+
+    if enable_gqa:
+        key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+        value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value, attn_weight
+
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, bias: bool = False, qk_layernorm: bool = True):
         super().__init__()
@@ -139,7 +169,7 @@ class MultiHeadAttention(nn.Module):
         k = k.flatten(-2, -1)
         return q, k
 
-    def forward(self, x, seq_id):
+    def forward(self, x, seq_id, need_head_weights: bool = False):
         qkv_BLD3 = self.layernorm_qkv(x)
         query_BLD, key_BLD, value_BLD = torch.chunk(qkv_BLD3, 3, dim=-1)
         query_BLD, key_BLD = (
@@ -152,6 +182,15 @@ class MultiHeadAttention(nn.Module):
         reshaper = functools.partial(einops.rearrange, pattern="b s (h d) -> b h s d", h=n_heads)
 
         query_BHLD, key_BHLD, value_BHLD = map(reshaper, (query_BLD, key_BLD, value_BLD))
+
+        if need_head_weights:
+            mask_BLL = seq_id.unsqueeze(-1) == seq_id.unsqueeze(-2)
+            mask_BHLL = mask_BLL.unsqueeze(1)
+            context_BHLD, attn = scaled_dot_product_attention(
+                query_BHLD, key_BHLD, value_BHLD, mask_BHLL
+            )
+            context_BLD = einops.rearrange(context_BHLD, "b h s d -> b s (h d)")
+            return self.out_proj(context_BLD), attn
 
         if seq_id is not None:
             # Where True, enable participation in attention.
@@ -293,6 +332,7 @@ class UnifiedTransformerBlock(nn.Module):
         sequence_id: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
+        need_head_weights: bool = False,
     ) -> torch.Tensor:
         """Forward pass for the UnifiedTransformerBlock.
 
@@ -308,14 +348,17 @@ class UnifiedTransformerBlock(nn.Module):
             The output tensor after applying the transformer block operations.
         """
         if self.use_flash_attn:
+            assert not need_head_weights
             r1 = self.attn(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
         else:
-            r1 = self.attn(x, sequence_id)
+            r1 = self.attn(x, sequence_id, need_head_weights=need_head_weights)
+            if need_head_weights:
+                r1, attn = r1
         x = x + r1 / self.scaling_factor
         r3 = self.ffn(x) / self.scaling_factor
         x = x + r3
 
-        return x
+        return x if not need_head_weights else (x, attn)
 
 
 class TransformerStack(nn.Module):
@@ -376,7 +419,11 @@ class TransformerStack(nn.Module):
         sequence_id: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        need_head_weights: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         """Forward pass of the TransformerStack.
 
         Args:
@@ -386,9 +433,20 @@ class TransformerStack(nn.Module):
             post_norm: The output tensor of shape (batch_size, sequence_length, d_model).
             pre_norm: The embedding of shape (batch_size, sequence_length, d_model).
         """
+        attns = []
         for block in self.blocks:
-            x = block(x, sequence_id, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
-        return self.norm(x), x
+            x = block(
+                x,
+                sequence_id,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                need_head_weights=need_head_weights,
+            )
+            if need_head_weights:
+                x, attn = x
+                attns.append(attn)
+        attns = torch.stack(attns, dim=1)
+        return (self.norm(x), x) if not need_head_weights else (self.norm(x), x, attns)
 
 
 def RegressionHead(d_model: int, output_dim: int, hidden_dim: int | None = None) -> nn.Module:
@@ -414,6 +472,7 @@ def RegressionHead(d_model: int, output_dim: int, hidden_dim: int | None = None)
 class ESMCOutput:
     sequence_logits: torch.Tensor
     embeddings: torch.Tensor | None
+    attentions: torch.Tensor | None
 
 
 class ESMC(nn.Module):
@@ -462,6 +521,7 @@ class ESMC(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: torch.Tensor | None = None,
         pad_fn: callable | None = None,
+        need_head_weights: bool = False,
     ) -> ESMCOutput:
         """Performs forward pass through the ESMC model. Check utils to see how to tokenize inputs
         from raw data.
@@ -487,12 +547,19 @@ class ESMC(nn.Module):
             max_seqlen = None
 
         x = self.embed(sequence_tokens)
-        x, _ = self.transformer(
-            x, sequence_id=sequence_id, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+        x = self.transformer(
+            x, sequence_id=sequence_id, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, need_head_weights=need_head_weights
         )
+        if not need_head_weights:
+            x, _ = x
+            attn = None
+        else:
+            x, _, attn = x
         sequence_logits = self.sequence_head(x)
         sequence_logits = pad_fn(sequence_logits)
-        output = ESMCOutput(sequence_logits=sequence_logits, embeddings=pad_fn(x))
+        output = ESMCOutput(
+            sequence_logits=sequence_logits, embeddings=pad_fn(x), attentions=attn
+        )
         return output
 
 
@@ -506,3 +573,16 @@ if __name__ == "__main__":
     print(output.sequence_logits.mean())
     print(output.embeddings.mean())
     print(output.embeddings.max())
+
+    with torch.inference_mode():
+        model = ESMC.from_pretrained("esmc_300m", use_flash_attn=False)
+        input_ids = model.tokenizer(sequence, return_tensors="pt")["input_ids"]
+        output2 = model(input_ids, need_head_weights=True)
+        print(output2.sequence_logits.mean())
+        print(output2.embeddings.mean())
+        print(output2.embeddings.max())
+        print(output2.attentions.shape)
+
+    output.embeddings = output.embeddings.cpu()
+    print(torch.allclose(output.embeddings, output2.embeddings))
+    print((output.embeddings - output2.embeddings).abs().max())
